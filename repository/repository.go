@@ -2,7 +2,9 @@ package repository
 
 import (
 	"bufio"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -10,21 +12,32 @@ import (
 )
 
 type User struct {
-	ID    int
-	Name  string
-	Email string
+	ID     int    `json:"id"`
+	Name   string `json:"name"`
+	Email  string `json:"email"`
+	APIKey string `json:"api_key,omitempty"`
 }
 
 type Bookmark struct {
-	ID        int
-	UserID    int
-	Title     string
-	URL       string
-	CreatedAt time.Time
+	ID        int       `json:"id"`
+	UserID    int       `json:"user_id"`
+	Title     string    `json:"title"`
+	URL       string    `json:"url"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // ErrEmailTaken signals that the email is already taken.
 var ErrEmailTaken = errors.New("email already in use")
+var ErrInvalidAPIKey = errors.New("invalid API key")
+
+// generateAPIKey creates a random 32-bytehex string
+func generateAPIKey() (string, error) {
+	bytes := make([]byte, 32)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(bytes), nil
+}
 
 // CreateUser inserts a new user, returning ErrEmailTaken if the email is already taken.
 func CreateUser(db *sql.DB, name, email string) (*User, error) {
@@ -43,19 +56,51 @@ func CreateUser(db *sql.DB, name, email string) (*User, error) {
 		return nil, ErrEmailTaken
 	}
 
-	// Exec executes a query without returning any rows.
-	// The '?' are placeholders for the parameters that follow the query string.
-	res, err := db.Exec("INSERT INTO users (name, email) VALUES (?, ?)", name, email)
+	// Generate API key
+	apiKey, err := generateAPIKey()
+	if err != nil {
+		return nil, fmt.Errorf("could not generate API key: %w", err)
+	}
+
+	// Insert user with API key
+	res, err := db.Exec("INSERT INTO users (name, email, api_key) VALUES (?, ?, ?)", name, email, apiKey)
 	if err != nil {
 		return nil, err
 	}
 
-	// LastInsertId returns the integer ID of the last row inserted.
 	id, err := res.LastInsertId()
 	if err != nil {
 		return nil, err
 	}
-	return &User{ID: int(id), Name: name, Email: email}, nil
+
+	return &User{ID: int(id), Name: name, Email: email, APIKey: apiKey}, nil
+}
+
+// GetUserByAPIKey retrieves a user by their API key.
+func GetUserByAPIKey(db *sql.DB, apiKey string) (*User, error) {
+	user := &User{}
+	err := db.QueryRow("SELECT id, name, email, api_key FROM users WHERE api_key = ?", apiKey).Scan(&user.ID, &user.Name, &user.Email, &user.APIKey)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, ErrInvalidAPIKey
+		}
+		return nil, err
+	}
+	return user, nil
+}
+
+// RegenerateAPIKey generates a new API key for a user.
+func RegenerateAPIKey(db *sql.DB, userID int) (string, error) {
+	newAPIKey, err := generateAPIKey()
+	if err != nil {
+		return "", fmt.Errorf("could not generate new API key: %w", err)
+	}
+
+	_, err = db.Exec("UPDATE users SET api_key = ? WHERE id = ?", newAPIKey, userID)
+	if err != nil {
+		return "", fmt.Errorf("could not update API key: %w", err)
+	}
+	return newAPIKey, nil
 }
 
 // CreateBookmark inserts a new bookmark for a given user.
@@ -160,6 +205,39 @@ func GetUserByEmail(db *sql.DB, email string) (*User, error) {
 		return nil, err // sql.ErrNoRows is returned if no user is found
 	}
 	return user, nil
+}
+
+// UpdateExistingUsersWithAPIKey generates API keys for users who don't have one.
+func UpdateExistingUsersWithAPIKey(db *sql.DB) error {
+	// Get all users without an API key
+	rows, err := db.Query("SELECT id FROM users WHERE api_key IS NULL")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	var userIDs []int
+	for rows.Next() {
+		var userID int
+		if err := rows.Scan(&userID); err != nil {
+			return err
+		}
+		userIDs = append(userIDs, userID)
+	}
+
+	// Generate API keys for each user
+	for _, userID := range userIDs {
+		apiKey, err := generateAPIKey()
+		if err != nil {
+			return fmt.Errorf("could not generate API key for user %d: %w", userID, err)
+		}
+
+		_, err = db.Exec("UPDATE users SET api_key = ? WHERE id = ?", apiKey, userID)
+		if err != nil {
+			return fmt.Errorf("could not update API key for user %d: %w", userID, err)
+		}
+	}
+	return nil
 }
 
 // DeleteBookmark is a helper func to prompt for a title and delete the bookmark.
